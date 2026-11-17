@@ -1,0 +1,124 @@
+name: Sales Analytics Local CI CD
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/**"
+      - "bugfix/**"
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: sales-analytics-local
+  cancel-in-progress: false
+
+jobs:
+  quality-and-build:
+    runs-on: [self-hosted, Windows, X64, sales-local]
+    steps:
+      - name: Checkout source for CI
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install development dependencies
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Ruff
+        shell: powershell
+        run: python -m ruff check .
+
+      - name: Pytest
+        shell: powershell
+        run: python -m pytest tests/ -v
+
+      - name: Build business package wheel
+        shell: powershell
+        run: python -m build --wheel
+
+      - name: Assemble offline deployment artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Commit = "${{ github.sha }}"
+          $RunNumber = "${{ github.run_number }}"
+          $DeployRoot = if ($env:SALES_DEPLOY_ROOT) {
+            $env:SALES_DEPLOY_ROOT
+          } else {
+            "C:\users\veens\Deployment\SalesAnalyticsCICD"
+          }
+          $ArtifactDirectory = Join-Path $DeployRoot "artifacts\$Commit"
+          $PackageDirectory = Join-Path $env:RUNNER_TEMP "sales-package-$Commit"
+          if (Test-Path $PackageDirectory) {
+            Remove-Item $PackageDirectory -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path "$PackageDirectory\wheels" | Out-Null
+
+          Copy-Item "app.py" $PackageDirectory
+          Copy-Item "requirements-runtime.txt" $PackageDirectory
+          Copy-Item "dist\sales_analytics-*.whl" "$PackageDirectory\wheels"
+
+          python -m pip download --only-binary=:all: `
+            -r requirements-runtime.txt `
+            -d "$PackageDirectory\wheels"
+
+          @"
+          commit=$Commit
+          run_number=$RunNumber
+          built_at_utc=$(Get-Date).ToUniversalTime().ToString("o")
+          "@ | Set-Content "$PackageDirectory\build-info.txt"
+
+          New-Item -ItemType Directory -Force -Path $ArtifactDirectory | Out-Null
+          $ZipPath = Join-Path $ArtifactDirectory "SalesAnalytics-$Commit.zip"
+          if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
+          Compress-Archive -Path "$PackageDirectory\*" -DestinationPath $ZipPath
+          Write-Host "Created deployment artifact: $ZipPath"
+
+  deploy-dev:
+    needs: quality-and-build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Windows, X64, sales-local]
+    environment: dev
+    steps:
+      - name: Checkout deployment script only
+        uses: actions/checkout@v4
+      - name: Deploy the built artifact to DEV
+        shell: powershell
+        run: |
+          $Commit = "${{ github.sha }}"
+          $DeployRoot = if ($env:SALES_DEPLOY_ROOT) {
+            $env:SALES_DEPLOY_ROOT
+          } else {
+            "C:\users\veens\Deployment\SalesAnalyticsCICD"
+          }
+          $Artifact = Join-Path $DeployRoot "artifacts\$Commit\SalesAnalytics-$Commit.zip"
+          .\scripts\deploy.ps1 -EnvironmentName DEV -ArtifactPath $Artifact -Port 8501
+
+  deploy-qa:
+    needs: deploy-dev
+    runs-on: [self-hosted, Windows, X64, sales-local]
+    environment: qa
+    steps:
+      - name: Checkout deployment script only
+        uses: actions/checkout@v4
+      - name: Deploy the same artifact to QA
+        shell: powershell
+        run: |
+          $Commit = "${{ github.sha }}"
+          $DeployRoot = if ($env:SALES_DEPLOY_ROOT) {
+            $env:SALES_DEPLOY_ROOT
+          } else {
+            "C:\users\veens\Deployment\SalesAnalyticsCICD"
+          }
+          $Artifact = Join-Path $DeployRoot "artifacts\$Commit\SalesAnalytics-$Commit.zip"
+          .\scripts\deploy.ps1 -EnvironmentName QA -ArtifactPath $Artifact -Port 8502
