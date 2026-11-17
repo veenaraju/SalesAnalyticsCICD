@@ -178,17 +178,18 @@ if (Test-Path $PidFile) {
 
 }
 
-# Verify that the deployment port is available
-
+# Ensure the deployment port is freed if an older process is still listening
 $PortOwner = Get-NetTCPConnection `
     -LocalPort $Port `
     -State Listen `
     -ErrorAction SilentlyContinue
 
 if ($PortOwner) {
-
-    throw "Port $Port is already occupied. Check the existing process."
-
+    $PortOwner | ForEach-Object {
+        Write-Host "Stopping process $($_.OwningProcess) occupying port $Port..."
+        Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 2
 }
 
 Write-Host "Previous application stopped."
@@ -253,31 +254,31 @@ Remove-Item $StdOut, $StdErr `
     -Force `
     -ErrorAction SilentlyContinue
 
-# Start Streamlit in background
+# Start Streamlit detached from the GitHub Actions Runner job object
+# so the runner does not kill Streamlit when the workflow step finishes.
+$env:RUNNER_TRACKING_ID = $null
 
-$Arguments = "-m streamlit run `"$InstalledApp`" --server.address $AppAddress --server.port $Port --server.headless true --browser.gatherUsageStats false"
+$CommandLine = "`"$Python`" -m streamlit run `"$InstalledApp`" --server.address $AppAddress --server.port $Port --server.headless true --browser.gatherUsageStats false"
 
-$Process = Start-Process `
-    -FilePath $Python `
-    -ArgumentList $Arguments `
-    -WorkingDirectory $EnvPath `
-    -RedirectStandardOutput $StdOut `
-    -RedirectStandardError $StdErr `
-    -WindowStyle Hidden `
-    -PassThru
+$WmiResult = Invoke-CimMethod `
+    -ClassName Win32_Process `
+    -MethodName Create `
+    -Arguments @{
+        CommandLine      = $CommandLine
+        CurrentDirectory = $EnvPath
+    }
 
-if (-not $Process) {
-
-    throw "Unable to start Streamlit."
-
+if ($WmiResult.ReturnValue -ne 0 -or -not $WmiResult.ProcessId) {
+    throw "Unable to start Streamlit (WMI return code: $($WmiResult.ReturnValue))."
 }
 
-# Save PID
+$ProcessId = [int]$WmiResult.ProcessId
 
-Set-Content -Path $PidFile -Value $Process.Id
+# Save PID
+Set-Content -Path $PidFile -Value $ProcessId
 
 Write-Host "Streamlit started."
-Write-Host "Process ID: $($Process.Id)"
+Write-Host "Process ID: $ProcessId"
 
 
 # =====================================================
@@ -295,7 +296,7 @@ for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
     Start-Sleep -Seconds 2
 
     $RunningProcess = Get-Process `
-        -Id $Process.Id `
+        -Id $ProcessId `
         -ErrorAction SilentlyContinue
 
     if (-not $RunningProcess) {
@@ -332,19 +333,13 @@ for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
 
 if (-not $ApplicationReady) {
 
-    Stop-Process -Id $Process.Id -Force `
+    Stop-Process -Id $ProcessId -Force `
         -ErrorAction SilentlyContinue
 
     Remove-Item $PidFile -Force `
         -ErrorAction SilentlyContinue
 
     Write-Host "Application startup failed."
-
-    if (Test-Path $StdErr) {
-
-        Get-Content $StdErr -Tail 30
-
-    }
 
     throw "Streamlit health check failed."
 
@@ -364,7 +359,7 @@ Write-Host "================================================="
 
 Write-Host "Environment : $EnvironmentName"
 Write-Host "URL         : $ApplicationUrl"
-Write-Host "Process ID  : $($Process.Id)"
+Write-Host "Process ID  : $ProcessId"
 Write-Host "PID File    : $PidFile"
 Write-Host "Logs        : $LogFolder"
 
