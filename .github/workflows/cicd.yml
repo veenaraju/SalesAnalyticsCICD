@@ -1,3 +1,4 @@
+
 name: Sales Analytics Local CI CD
 
 on:
@@ -6,6 +7,7 @@ on:
       - main
       - "feature/**"
       - "bugfix/**"
+
   pull_request:
     branches:
       - main
@@ -15,62 +17,158 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+
+  # =====================================================
+  # CI - ACTION RUNNER ENVIRONMENT
+  # =====================================================
+
   quality-and-build:
+
     runs-on: [self-hosted, Windows, X64, sales-local]
+
     steps:
+
       - name: Checkout source for CI
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - name: Check Python 3.11
+        shell: powershell
+        run: |
+          py -3.11 --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Python 3.11 is not available on the runner."
+          }
+
+      - name: Create Action Runner virtual environment
+        shell: powershell
+        run: |
+          $VenvPath = "C:\Users\veens\Python_Projects\action-runner\_venvs\SalesAnalyticsCI"
+
+          New-Item -ItemType Directory -Force -Path (Split-Path $VenvPath) | Out-Null
+
+          if (!(Test-Path "$VenvPath\Scripts\python.exe")) {
+            py -3.11 -m venv $VenvPath
+          }
+
+          if (!(Test-Path "$VenvPath\Scripts\python.exe")) {
+            throw "CI virtual environment creation failed."
+          }
+
+          & "$VenvPath\Scripts\python.exe" --version
 
       - name: Install development dependencies
         shell: powershell
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
-          python -m pip install -e .
+          $Python = "C:\Users\veens\Python_Projects\action-runner\_venvs\SalesAnalyticsCI\Scripts\python.exe"
+
+          & $Python -m pip install --upgrade pip
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pip upgrade failed."
+          }
+
+          & $Python -m pip install -r requirements-dev.txt
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Development dependency installation failed."
+          }
+
+          & $Python -m pip install -e .
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Editable package installation failed."
+          }
+
+          & $Python -m pip install build
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build installation failed."
+          }
 
       - name: Ruff
         shell: powershell
-        run: python -m ruff check .
+        run: |
+          $Python = "C:\Users\veens\Python_Projects\action-runner\_venvs\SalesAnalyticsCI\Scripts\python.exe"
+
+          & $Python -m ruff check .
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Ruff checks failed."
+          }
 
       - name: Pytest
         shell: powershell
-        run: python -m pytest tests/ -v
+        run: |
+          $Python = "C:\Users\veens\Python_Projects\action-runner\_venvs\SalesAnalyticsCI\Scripts\python.exe"
+
+          & $Python -m pytest tests/ -v
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pytest execution failed."
+          }
 
       - name: Build business package wheel
         shell: powershell
-        run: python -m build --wheel
+        run: |
+          $Python = "C:\Users\veens\Python_Projects\action-runner\_venvs\SalesAnalyticsCI\Scripts\python.exe"
+
+          & $Python -m build --wheel
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Package build failed."
+          }
+
+      # =================================================
+      # BUILD OFFLINE DEPLOYMENT ARTIFACT
+      # =================================================
 
       - name: Assemble offline deployment artifact
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
+
+          $Python = "C:\Users\veens\Python_Projects\action-runner\_venvs\SalesAnalyticsCI\Scripts\python.exe"
+
           $Commit = "${{ github.sha }}"
           $RunNumber = "${{ github.run_number }}"
+
           $DeployRoot = if ($env:SALES_DEPLOY_ROOT) {
             $env:SALES_DEPLOY_ROOT
           } else {
             "C:\users\veens\Deployment\SalesAnalyticsCICD"
           }
+
           $ArtifactDirectory = Join-Path $DeployRoot "artifacts\$Commit"
+
           $PackageDirectory = Join-Path $env:RUNNER_TEMP "sales-package-$Commit"
+
           if (Test-Path $PackageDirectory) {
             Remove-Item $PackageDirectory -Recurse -Force
           }
+
           New-Item -ItemType Directory -Force -Path "$PackageDirectory\wheels" | Out-Null
 
           Copy-Item "app.py" $PackageDirectory
-          Copy-Item "requirements-runtime.txt" $PackageDirectory
-          Copy-Item "dist\sales_analytics-*.whl" "$PackageDirectory\wheels"
 
-          python -m pip download --only-binary=:all: `
+          Copy-Item "requirements-runtime.txt" $PackageDirectory
+
+          $Wheel = Get-ChildItem "dist\sales_analytics-*.whl"
+
+          if (!$Wheel) {
+            throw "Business package wheel not found."
+          }
+
+          Copy-Item $Wheel.FullName "$PackageDirectory\wheels"
+
+          & $Python -m pip download --only-binary=:all: `
             -r requirements-runtime.txt `
             -d "$PackageDirectory\wheels"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Offline dependency download failed."
+          }
 
           @"
           commit=$Commit
@@ -79,46 +177,163 @@ jobs:
           "@ | Set-Content "$PackageDirectory\build-info.txt"
 
           New-Item -ItemType Directory -Force -Path $ArtifactDirectory | Out-Null
+
           $ZipPath = Join-Path $ArtifactDirectory "SalesAnalytics-$Commit.zip"
-          if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
+
+          if (Test-Path $ZipPath) {
+            Remove-Item $ZipPath -Force
+          }
+
           Compress-Archive -Path "$PackageDirectory\*" -DestinationPath $ZipPath
+
           Write-Host "Created deployment artifact: $ZipPath"
 
+
+  # =====================================================
+  # CD - DEV ENVIRONMENT
+  # =====================================================
+
   deploy-dev:
+
     needs: quality-and-build
+
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
     runs-on: [self-hosted, Windows, X64, sales-local]
+
     environment: dev
+
     steps:
-      - name: Checkout deployment script only
+
+      - name: Checkout deployment scripts
         uses: actions/checkout@v4
+
+      - name: Create DEV virtual environment
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          py -3.11 --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Python 3.11 is unavailable."
+          }
+
+          $DeployRoot = if ($env:SALES_DEPLOY_ROOT) {
+            $env:SALES_DEPLOY_ROOT
+          } else {
+            "C:\users\veens\Deployment\SalesAnalyticsCICD"
+          }
+
+          $VenvPath = Join-Path $DeployRoot "environments\dev\.venv"
+
+          New-Item -ItemType Directory -Force -Path (Split-Path $VenvPath) | Out-Null
+
+          if (!(Test-Path "$VenvPath\Scripts\python.exe")) {
+            py -3.11 -m venv $VenvPath
+          }
+
+          if (!(Test-Path "$VenvPath\Scripts\python.exe")) {
+            throw "DEV virtual environment creation failed."
+          }
+
+          & "$VenvPath\Scripts\python.exe" --version
+
       - name: Deploy the built artifact to DEV
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
+
           $Commit = "${{ github.sha }}"
+
           $DeployRoot = if ($env:SALES_DEPLOY_ROOT) {
             $env:SALES_DEPLOY_ROOT
           } else {
             "C:\users\veens\Deployment\SalesAnalyticsCICD"
           }
+
           $Artifact = Join-Path $DeployRoot "artifacts\$Commit\SalesAnalytics-$Commit.zip"
-          .\scripts\deploy.ps1 -EnvironmentName DEV -ArtifactPath $Artifact -Port 8501
+
+          if (!(Test-Path $Artifact)) {
+            throw "DEV deployment artifact not found: $Artifact"
+          }
+
+          .\scripts\deploy.ps1 `
+            -EnvironmentName DEV `
+            -ArtifactPath $Artifact `
+            -Port 8501
+
+
+  # =====================================================
+  # CD - QA ENVIRONMENT
+  # =====================================================
 
   deploy-qa:
+
     needs: deploy-dev
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
     runs-on: [self-hosted, Windows, X64, sales-local]
+
     environment: qa
+
     steps:
-      - name: Checkout deployment script only
+
+      - name: Checkout deployment scripts
         uses: actions/checkout@v4
+
+      - name: Create QA virtual environment
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          py -3.11 --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Python 3.11 is unavailable."
+          }
+
+          $DeployRoot = if ($env:SALES_DEPLOY_ROOT) {
+            $env:SALES_DEPLOY_ROOT
+          } else {
+            "C:\users\veens\Deployment\SalesAnalyticsCICD"
+          }
+
+          $VenvPath = Join-Path $DeployRoot "environments\qa\.venv"
+
+          New-Item -ItemType Directory -Force -Path (Split-Path $VenvPath) | Out-Null
+
+          if (!(Test-Path "$VenvPath\Scripts\python.exe")) {
+            py -3.11 -m venv $VenvPath
+          }
+
+          if (!(Test-Path "$VenvPath\Scripts\python.exe")) {
+            throw "QA virtual environment creation failed."
+          }
+
+          & "$VenvPath\Scripts\python.exe" --version
+
       - name: Deploy the same artifact to QA
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
+
           $Commit = "${{ github.sha }}"
+
           $DeployRoot = if ($env:SALES_DEPLOY_ROOT) {
             $env:SALES_DEPLOY_ROOT
           } else {
             "C:\users\veens\Deployment\SalesAnalyticsCICD"
           }
+
           $Artifact = Join-Path $DeployRoot "artifacts\$Commit\SalesAnalytics-$Commit.zip"
-          .\scripts\deploy.ps1 -EnvironmentName QA -ArtifactPath $Artifact -Port 8502
+
+          if (!(Test-Path $Artifact)) {
+            throw "QA deployment artifact not found: $Artifact"
+          }
+
+          .\scripts\deploy.ps1 `
+            -EnvironmentName QA `
+            -ArtifactPath $Artifact `
+            -Port 8502
