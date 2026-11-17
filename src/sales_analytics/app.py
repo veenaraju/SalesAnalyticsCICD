@@ -16,7 +16,7 @@ from sales_analytics.database import get_sales_data
 def main() -> None:
     load_dotenv(Path.cwd() / ".env", override=True)
 
-    st.set_page_config(page_title="Sales Analytics Updated", layout="wide")
+    st.set_page_config(page_title="Sales Analytics", layout="wide")
     st.title("Sales Analytics Dashboard")
     st.caption("Local CI/CD demonstration | Streamlit + Python + MySQL")
 
