@@ -1,3 +1,4 @@
+
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet("DEV", "QA")]
@@ -9,60 +10,369 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# =====================================================
+# 1. ENVIRONMENT CONFIGURATION
+# =====================================================
+
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
-$DeployRoot  = "C:\Users\veens\Deployment\SalesAnalyticsCICD"
-$EnvPath     = "$DeployRoot\$EnvironmentName"
-$VenvPath    = "$EnvPath\.venv"
-$Python      = "$VenvPath\Scripts\python.exe"
-$PidFile     = "$EnvPath\streamlit.pid"
 
-Write-Host "Deploying to $EnvironmentName ($EnvPath) on port $Port..."
+$DeployRoot = "C:\Users\veens\Deployment\SalesAnalyticsCICD"
+
+$EnvPath  = Join-Path $DeployRoot $EnvironmentName
+$VenvPath = Join-Path $EnvPath ".venv"
+$Python   = Join-Path $VenvPath "Scripts\python.exe"
+
+$PidFile = Join-Path $EnvPath "streamlit.pid"
+
+$LogFolder = Join-Path $EnvPath "logs"
+
+$StdOut = Join-Path $LogFolder "streamlit_stdout.log"
+$StdErr = Join-Path $LogFolder "streamlit_stderr.log"
+
+$AppAddress = "127.0.0.1"
+
+$ApplicationUrl = "http://localhost:$Port"
+
+Write-Host ""
+Write-Host "================================================="
+Write-Host " SALES ANALYTICS - $EnvironmentName DEPLOYMENT"
+Write-Host "================================================="
+Write-Host "Environment : $EnvironmentName"
+Write-Host "Port        : $Port"
+Write-Host "Location    : $EnvPath"
+Write-Host ""
+
 New-Item -ItemType Directory -Force -Path $EnvPath | Out-Null
+New-Item -ItemType Directory -Force -Path $LogFolder | Out-Null
 
-# 1. Copy .env if available and copy built .whl artifact (no .py files in deployment folder)
+
+# =====================================================
+# 2. COPY ENVIRONMENT CONFIGURATION
+# =====================================================
+
+Write-Host "[1/8] Preparing environment configuration..."
+
 $SourceEnv = @(
     "$ProjectRoot\$EnvironmentName\.env",
     "C:\Users\veens\Python_Projects\SalesAnalyticsCICD\$EnvironmentName\.env"
-) | Where-Object { Test-Path $_ } | Select-Object -First 1
+) |
+Where-Object { Test-Path $_ } |
+Select-Object -First 1
 
 if ($SourceEnv) {
+
     Copy-Item $SourceEnv "$EnvPath\.env" -Force
-} elseif (-not (Test-Path "$EnvPath\.env")) {
-    throw "No .env file found for $EnvironmentName. Place .env in $EnvPath\.env"
+
+    Write-Host "Environment configuration copied."
+
+}
+elseif (-not (Test-Path "$EnvPath\.env")) {
+
+    throw "No .env file found for $EnvironmentName."
+
+}
+else {
+
+    Write-Host "Using existing environment configuration."
+
 }
 
-Remove-Item "$EnvPath\*.py" -Force -ErrorAction SilentlyContinue
 
-$ArtifactWheel = Get-ChildItem "$DeployRoot\artifacts\sales_analytics-*.whl" | Select-Object -First 1
+# =====================================================
+# 3. IDENTIFY LATEST BUILD ARTIFACT
+# =====================================================
+
+Write-Host "[2/8] Identifying latest wheel artifact..."
+
+$ArtifactFolder = Join-Path $DeployRoot "artifacts"
+
+$ArtifactWheel = Get-ChildItem `
+    -Path $ArtifactFolder `
+    -Filter "sales_analytics-*.whl" `
+    -File |
+Sort-Object LastWriteTime -Descending |
+Select-Object -First 1
+
 if (-not $ArtifactWheel) {
-    throw "Built wheel not found in $DeployRoot\artifacts"
+
+    throw "No sales_analytics wheel found in $ArtifactFolder"
+
 }
+
+Write-Host "Artifact: $($ArtifactWheel.Name)"
+
+# Remove previous wheel from environment folder
+
+Get-ChildItem $EnvPath -Filter "sales_analytics-*.whl" -File |
+Remove-Item -Force
+
+# Copy latest wheel
+
 Copy-Item $ArtifactWheel.FullName $EnvPath -Force
+
 $DeployedWheel = Join-Path $EnvPath $ArtifactWheel.Name
 
-# 2. Create separate .venv for this environment if needed
+
+# =====================================================
+# 4. CREATE VIRTUAL ENVIRONMENT
+# =====================================================
+
+Write-Host "[3/8] Checking Python virtual environment..."
+
 if (-not (Test-Path $Python)) {
-    Write-Host "Creating virtual environment for $EnvironmentName..."
+
+    Write-Host "Creating Python 3.11 virtual environment..."
+
     py -3.11 -m venv $VenvPath
+
+    if ($LASTEXITCODE -ne 0) {
+
+        throw "Virtual environment creation failed."
+
+    }
+
 }
 
-# 3. Stop existing running instance if any
+if (-not (Test-Path $Python)) {
+
+    throw "Python executable not found: $Python"
+
+}
+
+Write-Host "Python environment ready."
+
+
+# =====================================================
+# 5. STOP EXISTING APPLICATION
+# =====================================================
+
+Write-Host "[4/8] Stopping existing application..."
+
 if (Test-Path $PidFile) {
-    $OldPid = (Get-Content $PidFile -Raw).Trim()
-    Stop-Process -Id ([int]$OldPid) -Force -ErrorAction SilentlyContinue
-    Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
+
+    $OldPidText = (Get-Content $PidFile -Raw).Trim()
+
+    $OldPidValue = 0
+
+    if ([int]::TryParse($OldPidText, [ref]$OldPidValue)) {
+
+        $OldProcess = Get-Process `
+            -Id $OldPidValue `
+            -ErrorAction SilentlyContinue
+
+        if ($OldProcess) {
+
+            Write-Host "Stopping previous Streamlit process: $OldPidValue"
+
+            Stop-Process -Id $OldPidValue -Force
+
+            Wait-Process -Id $OldPidValue `
+                -Timeout 10 `
+                -ErrorAction SilentlyContinue
+
+        }
+
+    }
+
+    Remove-Item $PidFile -Force
+
 }
 
-# 4. Install dependencies & latest wheel into environment .venv
-& $Python -m pip install $DeployedWheel
-& $Python -m pip install --no-deps --force-reinstall $DeployedWheel
+# Verify that the deployment port is available
 
-# 5. Start Streamlit from the installed package inside .venv
-$InstalledApp = "$VenvPath\Lib\site-packages\sales_analytics\app.py"
-$Process = Start-Process -FilePath $Python `
-    -ArgumentList "-m", "streamlit", "run", $InstalledApp, "--server.port", "$Port", "--server.headless", "true" `
+$PortOwner = Get-NetTCPConnection `
+    -LocalPort $Port `
+    -State Listen `
+    -ErrorAction SilentlyContinue
+
+if ($PortOwner) {
+
+    throw "Port $Port is already occupied. Check the existing process."
+
+}
+
+Write-Host "Previous application stopped."
+
+
+# =====================================================
+# 6. INSTALL APPLICATION PACKAGE
+# =====================================================
+
+Write-Host "[5/8] Installing application package..."
+
+& $Python -m pip install --upgrade pip
+
+if ($LASTEXITCODE -ne 0) {
+
+    throw "Pip upgrade failed."
+
+}
+
+# Install latest wheel and dependencies
+
+& $Python -m pip install --force-reinstall $DeployedWheel
+
+if ($LASTEXITCODE -ne 0) {
+
+    throw "Application installation failed."
+
+}
+
+# Verify Streamlit
+
+& $Python -m pip show streamlit
+
+if ($LASTEXITCODE -ne 0) {
+
+    throw "Streamlit is not installed."
+
+}
+
+Write-Host "Application package installed successfully."
+
+
+# =====================================================
+# 7. START STREAMLIT APPLICATION
+# =====================================================
+
+Write-Host "[6/8] Starting Streamlit application..."
+
+$InstalledApp = Join-Path `
+    $VenvPath `
+    "Lib\site-packages\sales_analytics\app.py"
+
+if (-not (Test-Path $InstalledApp)) {
+
+    throw "Installed application not found: $InstalledApp"
+
+}
+
+# Clear old logs
+
+Remove-Item $StdOut, $StdErr `
+    -Force `
+    -ErrorAction SilentlyContinue
+
+# Start Streamlit in background
+
+$Arguments = "-m streamlit run `"$InstalledApp`" --server.address $AppAddress --server.port $Port --server.headless true --browser.gatherUsageStats false"
+
+$Process = Start-Process `
+    -FilePath $Python `
+    -ArgumentList $Arguments `
     -WorkingDirectory $EnvPath `
+    -RedirectStandardOutput $StdOut `
+    -RedirectStandardError $StdErr `
+    -WindowStyle Hidden `
     -PassThru
 
+if (-not $Process) {
+
+    throw "Unable to start Streamlit."
+
+}
+
+# Save PID
+
 Set-Content -Path $PidFile -Value $Process.Id
-Write-Host "$EnvironmentName deployed successfully at http://localhost:$Port (PID: $($Process.Id))"
+
+Write-Host "Streamlit started."
+Write-Host "Process ID: $($Process.Id)"
+
+
+# =====================================================
+# 8. VERIFY APPLICATION HEALTH
+# =====================================================
+
+Write-Host "[7/8] Checking application health..."
+
+$MaxAttempts = 30
+
+$ApplicationReady = $false
+
+for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
+
+    Start-Sleep -Seconds 2
+
+    $RunningProcess = Get-Process `
+        -Id $Process.Id `
+        -ErrorAction SilentlyContinue
+
+    if (-not $RunningProcess) {
+
+        break
+
+    }
+
+    try {
+
+        $Response = Invoke-WebRequest `
+            -Uri "http://$AppAddress`:$Port/_stcore/health" `
+            -UseBasicParsing `
+            -TimeoutSec 2
+
+        if ($Response.StatusCode -eq 200) {
+
+            $ApplicationReady = $true
+
+            break
+
+        }
+
+    }
+    catch {
+
+        # Wait for Streamlit startup.
+
+    }
+
+    Write-Host "Waiting for application... $Attempt/$MaxAttempts"
+
+}
+
+if (-not $ApplicationReady) {
+
+    Stop-Process -Id $Process.Id -Force `
+        -ErrorAction SilentlyContinue
+
+    Remove-Item $PidFile -Force `
+        -ErrorAction SilentlyContinue
+
+    Write-Host "Application startup failed."
+
+    if (Test-Path $StdErr) {
+
+        Get-Content $StdErr -Tail 30
+
+    }
+
+    throw "Streamlit health check failed."
+
+}
+
+
+# =====================================================
+# 9. OPEN APPLICATION IN BROWSER
+# =====================================================
+
+Write-Host "[8/8] Opening application in browser..."
+
+Write-Host ""
+Write-Host "================================================="
+Write-Host " DEPLOYMENT SUCCESSFUL"
+Write-Host "================================================="
+
+Write-Host "Environment : $EnvironmentName"
+Write-Host "URL         : $ApplicationUrl"
+Write-Host "Process ID  : $($Process.Id)"
+Write-Host "PID File    : $PidFile"
+Write-Host "Logs        : $LogFolder"
+
+# Open default Windows browser
+
+Start-Process -FilePath $ApplicationUrl
+
+Write-Host ""
+Write-Host "$EnvironmentName application opened in browser."
+
+Write-Host "================================================="
