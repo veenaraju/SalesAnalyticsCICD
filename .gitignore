@@ -24,6 +24,8 @@ dist/
 .env
 .env-*
 !.env.example
+!DEV/.env
+!QA/.env
 
 # Logs and process files
 *.log

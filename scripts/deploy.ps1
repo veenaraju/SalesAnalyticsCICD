@@ -19,8 +19,18 @@ $PidFile     = "$EnvPath\streamlit.pid"
 Write-Host "Deploying to $EnvironmentName ($EnvPath) on port $Port..."
 New-Item -ItemType Directory -Force -Path $EnvPath | Out-Null
 
-# 1. Copy .env and built .whl artifact (no .py files in deployment folder)
-Copy-Item "$ProjectRoot\$EnvironmentName\.env" "$EnvPath\.env" -Force
+# 1. Copy .env if available and copy built .whl artifact (no .py files in deployment folder)
+$SourceEnv = @(
+    "$ProjectRoot\$EnvironmentName\.env",
+    "C:\Users\veens\Python_Projects\SalesAnalyticsCICD\$EnvironmentName\.env"
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+if ($SourceEnv) {
+    Copy-Item $SourceEnv "$EnvPath\.env" -Force
+} elseif (-not (Test-Path "$EnvPath\.env")) {
+    throw "No .env file found for $EnvironmentName. Place .env in $EnvPath\.env"
+}
+
 Remove-Item "$EnvPath\*.py" -Force -ErrorAction SilentlyContinue
 
 $ArtifactWheel = Get-ChildItem "$DeployRoot\artifacts\sales_analytics-*.whl" | Select-Object -First 1
