@@ -1,13 +1,22 @@
+
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=65", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "sales-analytics"
 version = "1.0.0"
-description = "Sales Analytics business logic for a local CI/CD demo"
+description = "Sales Analytics Application"
 requires-python = ">=3.11"
-dependencies = ["pandas"]
+dependencies = [
+    "streamlit",
+    "pandas",
+    "numpy",
+    "plotly",
+    "sqlalchemy",
+    "pymysql",
+    "python-dotenv",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
