@@ -17,7 +17,7 @@ def main() -> None:
     load_dotenv(Path.cwd() / ".env", override=True)
 
     st.set_page_config(page_title="Sales Analytics", layout="wide")
-    st.title("Sales Analytics Dashboard")
+    st.title("Sales Analytics Dashboard Change")
     st.caption("Local CI/CD demonstration | Streamlit + Python + MySQL")
 
     try:
